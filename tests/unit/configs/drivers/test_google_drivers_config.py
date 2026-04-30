@@ -5,8 +5,8 @@ from griptape.configs.drivers import GoogleDriversConfig
 
 class TestGoogleDriversConfig:
     @pytest.fixture(autouse=True)
-    def mock_openai(self, mocker):
-        return mocker.patch("google.generativeai.GenerativeModel")
+    def mock_google_clients(self, mocker):
+        return mocker.patch("google.genai.Client")
 
     @pytest.fixture()
     def config(self):
