@@ -96,8 +96,10 @@ class AmazonBedrockPromptDriver(BasePromptDriver):
         if reasoning_content_index is not None:
             message_content.insert(0, message_content.pop(reasoning_content_index))
 
+        message_contents = [self.__to_prompt_stack_message_content(content) for content in message_content]
+
         return Message(
-            content=[self.__to_prompt_stack_message_content(content) for content in message_content],
+            content=[content for content in message_contents if content is not None],
             role=Message.ASSISTANT_ROLE,
             usage=Message.Usage(input_tokens=usage["inputTokens"], output_tokens=usage["outputTokens"]),
         )
@@ -225,7 +227,12 @@ class AmazonBedrockPromptDriver(BasePromptDriver):
             return {"image": {"format": artifact.format, "source": {"bytes": artifact.value}}}
         return {"text": artifact.to_text()}
 
-    def __to_prompt_stack_message_content(self, content: dict) -> BaseMessageContent:
+    def __to_prompt_stack_message_content(self, content: dict) -> BaseMessageContent | None:
+        """Convert a Bedrock content block to message content, or None when it carries none.
+
+        `reasoningContent` is a tagged union -- `reasoningText` | `redactedContent` -- and only
+        `reasoningText` holds text to surface.
+        """
         if "text" in content:
             return TextMessageContent(TextArtifact(content["text"]))
         if "toolUse" in content:
@@ -241,10 +248,23 @@ class AmazonBedrockPromptDriver(BasePromptDriver):
                 ),
             )
         if "reasoningContent" in content:
-            return TextMessageContent(TextArtifact(content["reasoningContent"]["reasoningText"]["text"]))
+            reasoning_content = content["reasoningContent"]
+
+            if "reasoningText" in reasoning_content:
+                return TextMessageContent(TextArtifact(reasoning_content["reasoningText"]["text"]))
+            # `redactedContent` is encrypted, so it contributes no content. Surfacing empty text
+            # instead would round-trip to Bedrock as a blank text block, which it rejects.
+            if "redactedContent" in reasoning_content:
+                return None
         raise ValueError(f"Unsupported message content type: {content}")
 
-    def __to_prompt_stack_delta_message_content(self, event: dict) -> BaseDeltaMessageContent:
+    def __to_prompt_stack_delta_message_content(self, event: dict) -> BaseDeltaMessageContent | None:
+        """Convert a Bedrock stream event to delta content, or None when it carries none.
+
+        `reasoningContent` deltas are a tagged union — exactly one of `text`, `signature`, or
+        `redactedContent` is set — and only `text` holds content to surface. The others return None,
+        which `BasePromptDriver.__process_stream` already skips.
+        """
         if "contentBlockStart" in event:
             content_block = event["contentBlockStart"]["start"]
 
@@ -277,9 +297,17 @@ class AmazonBedrockPromptDriver(BasePromptDriver):
                     partial_input=content_block_delta["delta"]["toolUse"]["input"],
                 )
             if "reasoningContent" in content_block_delta["delta"]:
-                return TextDeltaMessageContent(
-                    content_block_delta["delta"]["reasoningContent"]["text"],
-                    index=content_block_delta["contentBlockIndex"],
-                )
+                reasoning_content = content_block_delta["delta"]["reasoningContent"]
+
+                if "text" in reasoning_content:
+                    return TextDeltaMessageContent(
+                        reasoning_content["text"],
+                        index=content_block_delta["contentBlockIndex"],
+                    )
+                # `signature` closes a reasoning block and `redactedContent` is encrypted; neither
+                # carries text to surface, so they contribute no content to the message.
+                if "signature" in reasoning_content or "redactedContent" in reasoning_content:
+                    return None
+                raise ValueError(f"Unsupported message content type: {event}")
             raise ValueError(f"Unsupported message content type: {event}")
         raise ValueError(f"Unsupported message content type: {event}")
